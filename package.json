@@ -1,50 +1,18 @@
 {
-  "name": "sandbox-sdk",
+  "name": "sandbox-terminal-workspace-example",
   "private": true,
-  "description": "Application-owned sandbox patterns and workspace file operations for Cloudflare Containers",
-  "workspaces": [
-    "packages/*",
-    "examples/*",
-    "examples/coding-agents/*"
-  ],
   "type": "module",
   "scripts": {
-    "build": "vp pack && npm run shim:build",
-    "changeset": "changeset",
-    "check": "npm run check:ts && npm run shim:check",
-    "check:ts": "vp pack && vp check && npm run knip",
-    "example": "node tools/example.ts",
-    "examples:check-bundles": "node tools/example.ts check-bundles",
-    "knip": "knip",
-    "shim:build": "docker build --platform linux/amd64 ${SANDBOX_EXTRA_CA:+--secret id=extra_ca,src=$SANDBOX_EXTRA_CA} --target image --tag sandbox-tools:local --file images/sandbox-tools/Dockerfile .",
-    "shim:check": "docker build --platform linux/amd64 ${SANDBOX_EXTRA_CA:+--secret id=extra_ca,src=$SANDBOX_EXTRA_CA} --target verify --file images/sandbox-tools/Dockerfile .",
-    "test": "npm run test:unit && npm run shim:check",
-    "test:unit": "vp test --run --passWithNoTests",
-    "test:package": "vp pack && vp test --run packages/sandbox/tests/packed-api.test.ts && npm pack --workspace packages/sandbox --dry-run",
-    "test:release": "npm test && npm run test:package && npm run test:shim-mounts && npm run test:s3-e2e && npm run test:s3-lifecycle",
-    "test:shim-mounts": "docker build --platform linux/amd64 ${SANDBOX_EXTRA_CA:+--secret id=extra_ca,src=$SANDBOX_EXTRA_CA} --target mounts --tag sandbox-tools-mounts-test --file images/sandbox-tools/Dockerfile . && docker run --rm --privileged --platform linux/amd64 sandbox-tools-mounts-test; status=$?; docker image rm sandbox-tools-mounts-test >/dev/null 2>&1; exit $status",
-    "test:s3-e2e": "npm run test:s3-fixtures && SANDBOX_S3_E2E=1 vp test --run packages/sandbox/tests/s3-gateway.integration.test.ts",
-    "test:s3-fixtures": "node packages/sandbox/tests/s3-fixtures.ts",
-    "test:s3-lifecycle": "npm run test:s3-fixtures && SANDBOX_S3_LIFECYCLE=1 vp test --run packages/sandbox/tests/s3-mount.integration.test.ts",
-    "test:s3-native-local": "vp pack && SANDBOX_S3_NATIVE_LOCAL=1 vp test --run packages/sandbox/tests/s3-native-local.integration.test.ts"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types --include-runtime=false"
+  },
+  "dependencies": {
+    "zod": "^4.5.4"
   },
   "devDependencies": {
-    "@changesets/changelog-github": "1.0.1",
-    "@changesets/cli": "3.0.3",
-    "@changesets/read": "1.0.1",
-    "@cloudflare/workers-types": "5.20261023.1",
-    "@types/node": "24.19.2",
-    "knip": "6.42.1",
-    "typescript": "6.0.3",
-    "vite-plus": "1.4.0",
-    "wrangler": "4.152.0",
-    "zod": "4.6.7"
-  },
-  "overrides": {
-    "wrangler": "$wrangler"
-  },
-  "engines": {
-    "node": ">=24.11.0"
-  },
-  "packageManager": "npm@11.16.0"
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.148.0"
+  }
 }
