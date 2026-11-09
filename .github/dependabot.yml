@@ -1,0 +1,99 @@
+# Version updates arrive weekly, one grouped pull request per block for minor and patch
+# updates. Each major update gets its own pull request unless a block groups it. Security
+# updates are grouped the same way, separately.
+version: 2
+updates:
+  # The root covers every workspace and the root lockfile. The preview app has its own
+  # lockfile.
+  - package-ecosystem: npm
+    directories:
+      - /
+      - /examples/preview-workspace/app
+    schedule:
+      interval: weekly
+    # The root's exact pins and the lockfile hold the versions the repository tests. An
+    # example's range is only the minimum it needs, since `npm create cloudflare` installs
+    # the latest Wrangler into a cloned example anyway. So ranges move only when a new
+    # version falls outside them.
+    versioning-strategy: increase-if-necessary
+    ignore:
+      # Examples pin the published package together with their donor image tag, and
+      # `npm run example -- set-version` moves both after a stable release.
+      - dependency-name: "@cloudflare/sandbox"
+      # Node types follow the Node major the repository runs on.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # TypeScript 7 has no JavaScript API, which `tools/example.ts` uses to read tsconfig
+      # files, so moving to it is a migration, not a version update.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+    groups:
+      npm:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # Separate from the root, so a template that fails to update never holds back the
+  # repository's own updates. Dependabot can't edit the template's nested miniflare
+  # override, so a Wrangler update here needs it moved to the miniflare that Wrangler
+  # depends on.
+  - package-ecosystem: npm
+    directory: /templates/openai-agents-api
+    schedule:
+      interval: weekly
+    ignore:
+      # Node types follow the Node major the template runs on.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # vitest majors wait until @cloudflare/vitest-pool-workers accepts them as its peer.
+      - dependency-name: vitest
+        update-types: ["version-update:semver-major"]
+    groups:
+      openai-agents-api:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      openai-agents-api-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Dependabot reads only literal `FROM image:tag` lines, not images set through an `ARG`.
+  # The donor image tag moves with `set-version`; the pinned Ubuntu digest moves by hand.
+  - package-ecosystem: docker
+    directories:
+      - /images/sandbox-tools
+      - /examples/*
+      - /examples/coding-agents/*
+      - /templates/*
+    schedule:
+      interval: weekly
+    groups:
+      # Every Node update, majors included, arrives as one pull request across all
+      # directories, so the images move to a new Node major together.
+      node:
+        patterns: ["node"]
+      docker:
+        patterns: ["*"]
+        update-types: [minor, patch]

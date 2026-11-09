@@ -1,0 +1,111 @@
+# Testing
+
+This page explains how to check a change before you commit it: what each command runs, what it proves, and what it cannot prove.
+
+## Before you start
+
+- Node.js 24.11 or later. Run `npm install` in the repository root.
+- Docker with BuildKit. The shim builds for `linux/amd64`, so on an Arm machine Docker needs amd64 emulation.
+- If your network inspects TLS, set `SANDBOX_EXTRA_CA` to a CA bundle that trusts it. Image builds pass the bundle as a BuildKit secret, so it never becomes part of an image. Without the variable, builds work as before.
+
+Done when `npm install` finishes and `docker info` succeeds.
+
+## Check every change
+
+Run both commands before each commit:
+
+```sh
+npm run check
+npm test
+```
+
+`npm run check` runs `check:ts`, then `shim:check`, described below. `check:ts` runs:
+
+1. `vp pack`, which builds the package into `packages/sandbox/dist`.
+2. `vp check`, which formats, lints, and type-checks the TypeScript. The lint rules include the anti-slop rules in `tools/oxlint/anti-slop`. Fix what they report instead of adding a suppression.
+3. `knip`, which finds unused files, exports, and dependencies.
+
+`npm test` runs `test:unit`, the package's unit tests with `vp test`, then `shim:check` again. Integration tests skip themselves unless you turn them on.
+
+Done when both commands exit with code `0`.
+
+To run one test file while you work:
+
+```sh
+npx vp test run packages/sandbox/tests/read-file.test.ts
+```
+
+### Unit tests
+
+The unit tests in `packages/sandbox/tests` run in Node.js, not in workerd. They give the package test doubles instead of a container: `helpers.ts` builds shim frames and fake processes, `worker-test-doubles.ts` provides Worker runtime objects such as `ExecutionContext`, and `cloudflare-workers.ts` stands in for the `cloudflare:workers` module. The lint rules forbid module mocking, so pass doubles in through constructors and parameters.
+
+### Shim checks
+
+`npm run shim:check` builds the `verify` target of `images/sandbox-tools/Dockerfile` for `linux/amd64`. Each stage fails the build when its check fails:
+
+1. `cargo fmt --check`, `cargo clippy` with warnings as errors, and `cargo test`. The tests include `crates/sandbox-tools/tests/shim.rs`, which runs the built binary as a subprocess.
+2. A static release build of `sandbox-shim`.
+3. The contract test, `packages/sandbox/tests/shim-contract.test.mjs`. It runs the real package code against the compiled shim through a stand-in for `exec()` that spawns local processes, so the Rust and TypeScript sides of the protocol are tested together.
+4. Checks that the binary is a 64-bit x86-64 ELF with no interpreter and no shared library dependencies.
+
+The Rust tests run inside the Linux build, so Linux-specific behavior is tested even on a Mac. Run `cargo test` on the host only for quick feedback. Tests that mount a tmpfs skip themselves in the build, which cannot mount; `npm run test:shim-mounts` reruns them in a privileged container.
+
+## Before a release
+
+`npm run test:release` runs everything below and `npm test`. Each part can also run on its own.
+
+| Command                     | What it proves                                                                                                                                                     | Needs                         |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------- |
+| `npm run test:package`      | The built package exports the expected runtime API. It also prints the files that `npm pack` would publish.                                                        | Nothing extra                 |
+| `npm run test:shim-mounts`  | The shim's tests pass with real mounts, including that a restore refuses a directory with a mount inside it and never deletes files inside a mount                 | Docker, privileged containers |
+| `npm run test:s3-e2e`       | `S3Gateway` authorizes, signs, and forwards the requests that a real `s3fs` sends to MinIO for reads, writes, renames, directories, multipart uploads, and deletes | Docker, privileged containers |
+| `npm run test:s3-lifecycle` | The shim mounts, reuses, inspects, denies, retries, and unmounts a real `s3fs` mount                                                                               | Docker, privileged containers |
+
+The S3 tests start MinIO and an `s3fs` container, and reach services on the host through `host.docker.internal`. They remove the containers and networks they create when they finish.
+
+Both commands first run `npm run test:s3-fixtures`, which builds or pulls the images the tests run: `s3fs` on Ubuntu, MinIO, and `socat`. It retries each download with a timeout. Each built image is tagged with a hash of its Dockerfile under `packages/sandbox/tests/fixtures`, so later runs reuse the images until a Dockerfile changes. Remove them with `docker image rm` when you no longer need them. The tests themselves download nothing, except that `test:s3-lifecycle` builds the shim image, which reuses the build cache from `npm run shim:check`. Run `shim:check` first so that build doesn't compile the shim again.
+
+`npm run test:s3-native-local` runs the full mount lifecycle under `wrangler dev`. It is not part of `test:release`, because it needs Wrangler and workerd builds that are not released yet. Set `SANDBOX_WRANGLER_PATH` and `MINIFLARE_WORKERD_PATH` to local checkouts that contain the commits listed in `packages/sandbox/tests/s3-native-local.integration.test.ts`.
+
+## On pull requests
+
+Pull requests into `main` and `next` need two passing checks and an approving review from a code owner in `.github/CODEOWNERS`.
+
+`ci/basic` comes from `.github/workflows/pr.yml`, on `pull_request`. Its TypeScript and Shim jobs together run `npm run check` and everything in `npm run test:release`, and its Examples job checks each example as a project of its own:
+
+- **TypeScript** runs `check:ts`, `examples:check-bundles`, `example -- check-versions`, `example -- sync-runner --check`, `test:unit`, and `test:package`. `examples:check-bundles` bundles every example without deploying it, and fails unless the package came from its local build. `check-versions` fails unless every example names the same package version and donor image tag. `sync-runner --check` fails unless each coding agent's copy of the runner matches `examples/coding-agents/runner`.
+- **Examples** runs `example -- check-standalone`, which installs each example outside the repository from npm, type-checks it, and bundles it. See [Examples](examples.md#check-it).
+- **Shim** runs `shim:check` and then the three tests in the table above that need privileged containers. They all build from the same Dockerfile on one Docker daemon, so the shim compiles once. It runs `test:s3-fixtures` as a step of its own before the S3 tests, so a slow download fails that step instead of a test.
+
+When a job fails, re-run only that job.
+
+`ci/gate` comes from `.github/workflows/pr-privileged.yml`, on `pull_request_target`. It deploys `examples/workspace` from the PR head to the CI account, under a Worker name unique to the run, behind an entry point that requires a token unique to the run. It writes, runs, reads, and resets one sandbox over HTTP. A separate job then deletes the Worker and its container application, and the check fails if either remains. Re-running the failed jobs deploys again under a new name.
+
+`pull_request_target` runs the workflow file from the base branch, with the repository's secrets, so a change to `pr-privileged.yml` takes effect only after it merges.
+
+`ci/gate` always runs the smoke test for a branch in this repository. For a fork PR:
+
+- When the PR changes only docs, `ci/gate` passes without deploying anything.
+- Otherwise `ci/gate` fails until a maintainer reads the head commit and adds the `ok-to-test` label. The run for that labeling event tests that commit. Any later event on the PR, such as a push, removes the label and fails the check again.
+
+The smoke test runs the PR's code with the CI account's API token. Add `ok-to-test` only to a commit you would run with that token yourself.
+
+## Test in production
+
+Local tests cannot show everything a deployed sandbox does. Under `wrangler dev`, the container has Docker's short hostname instead of the 64-character hostname of a deployed container, non-root users have no Linux capabilities, and reloading the Worker destroys the container instead of leaving it running. Deploy an example when a change depends on behavior like this.
+
+1. Log in with `npx wrangler login`, and set `CLOUDFLARE_ACCOUNT_ID` if your login has more than one account.
+2. Deploy the example:
+
+   ```sh
+   npm run example -- deploy workspace
+   ```
+
+   `tools/example.ts` builds the package and, when the example uses the shim, `sandbox-tools:local`. It deploys from a config written next to the example's own, which bundles the package from `packages/sandbox/dist` and builds the image from the local shim. Wrangler is the version in `package-lock.json`. See [Examples](examples.md#deploy-an-example).
+
+3. Follow the `curl` steps in the example's README. If your account puts `workers.dev` behind Cloudflare Access, add the header `cf-access-token: $(cloudflared access token -app=<WORKER_URL>)` to each request.
+4. Delete what you deployed. `npx wrangler delete --name <WORKER_NAME>` deletes the Worker but leaves its container application running ([workers-sdk#16008](https://github.com/cloudflare/workers-sdk/issues/16008)). Find the application in `npx wrangler containers list`, where it's named `<WORKER_NAME>-<class name in lowercase>`, and delete it with `npx wrangler containers delete <ID>`. Delete the image the deploy pushed with `npx wrangler containers images delete <IMAGE>:<TAG>`, from `npx wrangler containers images list`. Delete by exact ID or tag, never by a pattern.
+
+Done when the README's steps give the expected responses and the Worker, container application, and image are gone.
+
+Workers Observability records each request, log, and exception, which helps when a step fails. A Durable Object invocation marked `canceled` is often a client that disconnected, not a failure in the container.

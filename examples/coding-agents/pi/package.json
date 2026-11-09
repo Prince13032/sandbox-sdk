@@ -1,0 +1,19 @@
+{
+  "name": "sandbox-coding-agent-pi-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types --include-runtime=false"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "1.0.3",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.148.0"
+  }
+}

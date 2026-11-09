@@ -1,0 +1,18 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "workspaces": {
+    ".": {
+      // Each coding agent imports a copy of the runner that tools/example.ts writes, not the runner.
+      "entry": ["examples/coding-agents/runner/*.ts"],
+      "ignore": ["templates/**", "tools/oxlint/anti-slop/**"],
+      // The `wrangler` override pins every workspace to this version, and tools/example.ts runs it.
+      "ignoreDependencies": ["cloudflare", "wrangler"]
+    },
+    "examples/preview-workspace": {
+      "ignore": ["app/**"]
+    },
+    "packages/sandbox": {
+      "entry": ["src/index.ts", "tests/fixtures/s3-native-local/worker.ts"]
+    }
+  }
+}

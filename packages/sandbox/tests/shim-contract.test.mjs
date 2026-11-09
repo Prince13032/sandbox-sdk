@@ -1,0 +1,489 @@
+import { spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  mkdir as nativeMkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable, Writable } from "node:stream";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+import { DirectoryBackupGateway } from "../src/directory-backup/directory-backup-gateway.js";
+import { DirectoryBackup } from "../src/directory-backup/directory-backup.js";
+import { Files } from "../src/files/files.js";
+import { S3Mount } from "../src/s3-mount/s3-mount.js";
+import { SandboxBackupError } from "../src/shared/errors.js";
+import { FixedLengthStreamDouble, R2BucketDouble } from "./r2-bucket-double.js";
+import { TestExecutionContext } from "./worker-test-doubles.js";
+
+const SHIM_PATH = process.env.SANDBOX_SHIM_PATH;
+
+function nativeContainer(rewrite = (command) => command, intercept = () => undefined) {
+  return {
+    running: true,
+    interceptOutboundHttp(host, fetcher) {
+      intercept(host, fetcher);
+      return Promise.resolve();
+    },
+    exec(command, options) {
+      const child = spawn(SHIM_PATH, rewrite(command).slice(1), {
+        cwd: options.cwd,
+        stdio: [
+          options.stdin === "pipe" ? "pipe" : "ignore",
+          options.stdout === "pipe" ? "pipe" : "ignore",
+          options.stderr === "pipe" ? "pipe" : "ignore",
+        ],
+      });
+      const exitCode = new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, signal) => resolve(code ?? 128 + signalNumber(signal)));
+      });
+      return Promise.resolve({
+        stdin: child.stdin === null ? null : Writable.toWeb(child.stdin),
+        stdout: child.stdout === null ? null : Readable.toWeb(child.stdout),
+        stderr: child.stderr === null ? null : Readable.toWeb(child.stderr),
+        pid: child.pid,
+        isPty: false,
+        exitCode,
+        output() {
+          throw new Error("output is not used by file operations");
+        },
+        kill(signal) {
+          child.kill(signal);
+        },
+        resize() {},
+      });
+    },
+  };
+}
+
+function signalNumber(signal) {
+  return signal === "SIGKILL" ? 9 : 1;
+}
+
+describe.skipIf(SHIM_PATH === undefined)("compiled sandbox-shim contract", () => {
+  it("streams binary file contents through Files", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const path = join(directory, "content.bin");
+      const content = new Uint8Array([0, 1, 2, 255]);
+      await writeFile(path, content);
+
+      const response = await new Files(nativeContainer()).readFile(path);
+
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(content);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("streams Files writes into the destination", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const path = join(directory, "content.bin");
+      const content = new Uint8Array([255, 2, 1, 0]);
+
+      await new Files(nativeContainer()).writeFile(path, content);
+
+      expect(new Uint8Array(await readFile(path))).toEqual(content);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns complete metadata and native directory entries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      await writeFile(join(directory, "bravo.txt"), "bravo");
+      await writeFile(join(directory, "alpha.txt"), "alpha");
+      await nativeMkdir(join(directory, "charlie"));
+      await symlink("alpha.txt", join(directory, "current"));
+      const files = new Files(nativeContainer());
+
+      const stat = await files.stat(join(directory, "alpha.txt"));
+      expect(stat).toMatchObject({ type: "file", size: 5n });
+      expect(stat.mode & 0o170000).toBe(0o100000);
+      expect(stat.uid).toBeTypeOf("number");
+      expect(stat.gid).toBeTypeOf("number");
+      expect(stat.accessedAt).toBeInstanceOf(Date);
+      expect(stat.modifiedAt).toBeInstanceOf(Date);
+      expect(stat.changedAt).toBeInstanceOf(Date);
+      await expect(files.lstat(join(directory, "current"))).resolves.toMatchObject({
+        type: "symlink",
+      });
+      await expect(files.stat("/dev/null")).resolves.toMatchObject({ type: "characterDevice" });
+
+      const entries = await files.readDirectory(directory);
+      expect(entries).toHaveLength(4);
+      expect(entries).toEqual(
+        expect.arrayContaining([
+          { name: "alpha.txt", type: "file" },
+          { name: "bravo.txt", type: "file" },
+          { name: "charlie", type: "directory" },
+          { name: "current", type: "symlink" },
+        ]),
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("creates single and recursive directories", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const files = new Files(nativeContainer());
+      const single = join(directory, "single");
+      const nested = join(directory, "parent", "child");
+
+      await files.mkdir(single);
+      await files.mkdir(nested, { recursive: true });
+
+      await expect(files.stat(single)).resolves.toMatchObject({ type: "directory" });
+      await expect(files.stat(nested)).resolves.toMatchObject({ type: "directory" });
+      await expect(files.mkdir(single)).rejects.toMatchObject({ code: "EEXIST" });
+      await expect(files.mkdir(single, { recursive: true })).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("renames files and symlinks with native replacement semantics", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const files = new Files(nativeContainer());
+      const source = join(directory, "source.txt");
+      const destination = join(directory, "destination.txt");
+      const link = join(directory, "source-link");
+      const renamedLink = join(directory, "renamed-link");
+      await writeFile(source, "source");
+      await writeFile(destination, "destination");
+      await symlink("destination.txt", link);
+
+      await files.rename(source, destination);
+      await files.rename(link, renamedLink);
+
+      await expect(files.stat(source)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(destination, "utf8")).toBe("source");
+      await expect(files.lstat(renamedLink)).resolves.toMatchObject({ type: "symlink" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("removes files, symlinks, and directory trees", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const files = new Files(nativeContainer());
+      const file = join(directory, "file.txt");
+      const tree = join(directory, "tree");
+      const external = join(directory, "external");
+      const link = join(directory, "external-link");
+      await writeFile(file, "content");
+      await nativeMkdir(tree);
+      await nativeMkdir(external);
+      await writeFile(join(tree, "nested.txt"), "nested");
+      await writeFile(join(external, "keep.txt"), "keep");
+      await symlink(external, link);
+      await symlink(external, join(tree, "nested-link"));
+
+      await files.remove(file);
+      await files.remove(link);
+      await files.remove(tree, { recursive: true });
+      await files.remove(join(directory, "missing"), { force: true });
+
+      await expect(files.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(files.lstat(link)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(files.stat(tree)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(files.readFile(join(external, "keep.txt"))).resolves.toBeInstanceOf(Response);
+      await expect(files.remove(external, { force: true })).rejects.toMatchObject({
+        operation: "remove",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves native open and read errors", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const files = new Files(nativeContainer());
+
+      await expect(files.readFile(join(directory, "missing"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const response = await files.readFile(directory);
+      await expect(response.arrayBuffer()).rejects.toMatchObject({ code: "EISDIR" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves relative paths against cwd for every file operation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const files = new Files(nativeContainer());
+      const cwd = { cwd: directory };
+
+      // `..` after a symlinked cwd leaves the link's target, as it does after entering cwd.
+      await nativeMkdir(join(directory, "real", "sub"), { recursive: true });
+      await writeFile(join(directory, "real", "x"), "physical");
+      await symlink(join(directory, "real", "sub"), join(directory, "link"));
+      const linked = await files.readFile("../x", { cwd: join(directory, "link") });
+      await expect(linked.text()).resolves.toBe("physical");
+
+      await files.writeFile("notes.txt", "relative", cwd);
+      await expect((await files.readFile("notes.txt", cwd)).text()).resolves.toBe("relative");
+      await expect(files.stat("notes.txt", cwd)).resolves.toMatchObject({ size: 8n });
+      await files.mkdir("nested", cwd);
+      await files.rename("notes.txt", "nested/notes.txt", cwd);
+      await expect(files.readDirectory("nested", cwd)).resolves.toEqual([
+        { name: "notes.txt", type: "file" },
+      ]);
+      await files.remove("nested", { ...cwd, recursive: true });
+      await expect(files.lstat("nested", cwd)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a missing cwd as a file error for the path", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const files = new Files(nativeContainer());
+      const missing = { cwd: join(directory, "missing") };
+      const expected = { name: "SandboxFileError", code: "ENOENT", path: "notes.txt" };
+
+      await expect(files.readFile("notes.txt", missing)).rejects.toMatchObject(expected);
+      await expect(files.writeFile("notes.txt", "x", missing)).rejects.toMatchObject(expected);
+      await expect(files.stat("notes.txt", missing)).rejects.toMatchObject(expected);
+      await expect(files.stat(directory, missing)).resolves.toMatchObject({ type: "directory" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports and unmounts an absent S3 mount idempotently", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    try {
+      const container = nativeContainer();
+      const gateway = () => ({ fetch() {} });
+      const mounts = new S3Mount(container, gateway);
+
+      await expect(mounts.inspect(directory)).resolves.toEqual({
+        mountPath: directory,
+        attachment: { status: "absent" },
+      });
+      await mounts.unmount(directory);
+      await mounts.unmount(directory);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("decodes stale mount and gateway evidence from the compiled shim", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-shim-contract-"));
+    const markerName = `${createHash("sha256").update(directory).digest("hex")}.json`;
+    const markerPath = join("/run/sandbox/s3-mounts/markers", markerName);
+    const mounts = new S3Mount(nativeContainer(), () => ({ fetch() {} }));
+    try {
+      await nativeMkdir("/run/sandbox/s3-mounts/markers", { recursive: true });
+      await writeFile(
+        markerPath,
+        JSON.stringify({
+          protocolVersion: 1,
+          routeId: "contract-route",
+          mountPath: directory,
+          configuration: {
+            source: {
+              type: "s3",
+              endpoint: "http://minio:9000/",
+              region: "us-east-1",
+              bucket: "models",
+            },
+            keyPrefix: "current/",
+            access: "read-only",
+            s3fsOptions: [],
+          },
+        }),
+      );
+
+      await expect(
+        mounts.inspect(directory, { signal: AbortSignal.timeout(5_000) }),
+      ).resolves.toMatchObject({
+        mountPath: directory,
+        attachment: { status: "stale" },
+        gateway: { status: "unreachable" },
+      });
+      await mounts.unmount(directory);
+    } finally {
+      await rm(markerPath, { force: true });
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  describe("directory backups", () => {
+    beforeEach(() => {
+      vi.stubGlobal("FixedLengthStream", FixedLengthStreamDouble);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("backs up, restores over an existing directory, and deletes through the gateway", async () => {
+      const platform = await backupPlatform();
+      const directory = await mkdtemp(join(tmpdir(), "sandbox-backup-contract-"));
+      try {
+        const source = join(directory, "source");
+        await nativeMkdir(join(source, "nested"), { recursive: true });
+        await nativeMkdir(join(source, "skip"));
+        const random = randomBytes(3 * 1024 * 1024);
+        await writeFile(join(source, "random.bin"), random);
+        await writeFile(join(source, "nested", "note.txt"), "note");
+        await writeFile(join(source, "skip", "cache"), "cache");
+        await symlink("nested/note.txt", join(source, "link"));
+        const target = join(directory, "target");
+        await nativeMkdir(target);
+        await writeFile(join(target, "old.txt"), "old");
+
+        const record = await platform.backups.backup({ dir: source, exclude: ["skip/"] });
+        await platform.backups.restore(record, { dir: target });
+
+        expect(record).toMatchObject({ dir: source, format: "tar+zstd/1" });
+        expect(platform.bucket.objects.get(`backups/${record.id}.tar.zst`)?.bytes.length).toBe(
+          record.size,
+        );
+        expect((await readdir(target)).sort()).toEqual(["link", "nested", "random.bin"]);
+        expect(sha256(await readFile(join(target, "random.bin")))).toBe(sha256(random));
+        expect(await readlink(join(target, "link"))).toBe("nested/note.txt");
+        expect((await readdir(directory)).sort()).toEqual(["source", "target"]);
+        expect(platform.registrations.at(-1)).toBe("deny");
+
+        await platform.backups.delete(record);
+        const missing = await platform.backups
+          .restore(record, { dir: target })
+          .catch((cause) => cause);
+        expect(SandboxBackupError.is(missing) && missing.code).toBe("BACKUP_NOT_FOUND");
+        expect(sha256(await readFile(join(target, "random.bin")))).toBe(sha256(random));
+      } finally {
+        await platform.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a changed object without touching the target", async () => {
+      const platform = await backupPlatform();
+      const directory = await mkdtemp(join(tmpdir(), "sandbox-backup-contract-"));
+      try {
+        await writeFile(join(directory, "file.txt"), "original");
+        const record = await platform.backups.backup({ dir: directory });
+        const stored = platform.bucket.objects.get(`backups/${record.id}.tar.zst`);
+        const altered = new Uint8Array(stored.bytes);
+        altered[altered.length - 1] ^= 0xff;
+        platform.bucket.objects.set(`backups/${record.id}.tar.zst`, { ...stored, bytes: altered });
+        await writeFile(join(directory, "file.txt"), "changed");
+
+        const error = await platform.backups.restore(record).catch((cause) => cause);
+
+        expect(SandboxBackupError.is(error) && error.code).toBe("BACKUP_INTEGRITY");
+        expect(await readFile(join(directory, "file.txt"), "utf8")).toBe("changed");
+      } finally {
+        await platform.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("runs concurrent operations one at a time", async () => {
+      const platform = await backupPlatform();
+      const directory = await mkdtemp(join(tmpdir(), "sandbox-backup-contract-"));
+      try {
+        const dirs = ["a", "b", "c"].map((name) => join(directory, name));
+        for (const dir of dirs) {
+          await nativeMkdir(dir);
+          await writeFile(join(dir, "name"), dir);
+        }
+
+        const records = await Promise.all(dirs.map((dir) => platform.backups.backup({ dir })));
+
+        expect(records.map((record) => record.dir)).toEqual(dirs);
+        expect(platform.registrations.filter((mode) => mode === "write")).toHaveLength(3);
+      } finally {
+        await platform.close();
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Stands in for the platform: an HTTP server that forwards the shim's requests to whichever
+ * gateway the package registered last, as the outbound intercept does.
+ */
+async function backupPlatform() {
+  const bucket = new R2BucketDouble();
+  const registrations = [];
+  let current;
+  const server = createServer(async (incoming, outgoing) => {
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(incoming.headers)) {
+      if (name !== "host" && name !== "connection") headers.set(name, String(value));
+    }
+    const request = new Request(`http://backups.sandbox.internal${incoming.url}`, {
+      method: incoming.method,
+      headers,
+      body: incoming.method === "PUT" ? Readable.toWeb(incoming) : undefined,
+      duplex: "half",
+    });
+    const response = await current.fetch(request);
+    outgoing.writeHead(response.status, Object.fromEntries(response.headers));
+    if (response.body !== null) {
+      for await (const chunk of response.body) outgoing.write(chunk);
+    }
+    outgoing.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const authority = `127.0.0.1:${server.address().port}`;
+  const propsByGateway = new WeakMap();
+  const binding = ({ props }) => {
+    const gateway = new DirectoryBackupGateway(new TestExecutionContext(props), {
+      BACKUPS: bucket,
+    });
+    propsByGateway.set(gateway, props);
+    return gateway;
+  };
+  const container = nativeContainer(
+    (command) => {
+      if (command[1] !== "directory-backup") return command;
+      const request = JSON.parse(command[3]);
+      return [...command.slice(0, 3), JSON.stringify({ ...request, gateway: authority })];
+    },
+    (host, gateway) => {
+      expect(host).toBe("backups.sandbox.internal");
+      registrations.push(propsByGateway.get(gateway).mode);
+      current = gateway;
+    },
+  );
+  return {
+    bucket,
+    registrations,
+    backups: new DirectoryBackup(container, binding, { binding: "BACKUPS", prefix: "backups/" }),
+    close: () =>
+      new Promise((resolve) => {
+        server.close(resolve);
+        server.closeAllConnections();
+      }),
+  };
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@cloudflare/sandbox",
+  "version": "1.0.3",
+  "description": "Structured workspace file operations for Cloudflare sandboxes",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cloudflare/sandbox-sdk.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "aws4fetch": "1.0.20",
+    "zod": "4.6.7"
+  }
+}

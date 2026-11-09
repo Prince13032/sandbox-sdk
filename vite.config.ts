@@ -1,0 +1,89 @@
+import { defineConfig } from "vite-plus";
+import { fileURLToPath } from "node:url";
+
+const agentToolingIgnorePatterns = [
+  ".agent/**",
+  ".agents/**",
+  ".claude/**",
+  ".codex/**",
+  ".continue/**",
+  ".cursor/**",
+  ".gemini/**",
+  ".opencode/**",
+  ".pi/**",
+  ".roo/**",
+  ".windsurf/**",
+  "tools/oxlint/anti-slop/**",
+];
+
+// Each template has its own dependencies and is checked by the Templates workflow.
+const standaloneTemplatePatterns = ["templates/**"];
+
+// Copies of examples/coding-agents/runner, which is formatted and linted in their place.
+// `npm run example -- sync-runner --check` keeps them identical to it.
+const generatedPatterns = ["examples/coding-agents/*/src/runner/**"];
+
+export default defineConfig({
+  defaultPackage: {
+    pack: "./packages/sandbox",
+  },
+  fmt: {
+    ignorePatterns: [
+      ...agentToolingIgnorePatterns,
+      ...standaloneTemplatePatterns,
+      ...generatedPatterns,
+    ],
+  },
+  lint: {
+    ignorePatterns: [
+      ...agentToolingIgnorePatterns,
+      ...standaloneTemplatePatterns,
+      ...generatedPatterns,
+    ],
+    jsPlugins: [
+      {
+        name: "anti-slop",
+        specifier: "./tools/oxlint/anti-slop/index.ts",
+      },
+    ],
+    options: {
+      typeAware: true,
+      typeCheck: true,
+    },
+    rules: {
+      "anti-slop/no-chained-type-assertions": "error",
+      "anti-slop/no-conditional-empty-object-spread": "error",
+      "anti-slop/no-known-value-widening": "error",
+      "anti-slop/no-module-mocking": "error",
+      "anti-slop/no-object-parameters": "error",
+      "anti-slop/no-reflect-apply": "error",
+      "anti-slop/no-reflect-get": "error",
+      "anti-slop/no-runtime-typeof": "error",
+      "anti-slop/no-shape-in-symbol-names": "error",
+      "anti-slop/no-unknown-parameters": "error",
+      "anti-slop/no-unknown-returns": "error",
+      "anti-slop/no-unknown-type-aliases": "error",
+      "anti-slop/no-unsafe-dictionary-type": "error",
+      "anti-slop/no-widen-then-assert": "error",
+      "anti-slop/require-safety-comment-for-type-assertion": "error",
+    },
+  },
+  pack: {
+    deps: {
+      neverBundle: ["cloudflare:workers"],
+    },
+    dts: true,
+    format: ["esm"],
+  },
+  run: {
+    cache: true,
+  },
+  test: {
+    alias: {
+      "cloudflare:workers": fileURLToPath(
+        new URL("./packages/sandbox/tests/cloudflare-workers.ts", import.meta.url),
+      ),
+    },
+    exclude: ["**/node_modules/**", "**/.git/**", ...standaloneTemplatePatterns],
+  },
+});
